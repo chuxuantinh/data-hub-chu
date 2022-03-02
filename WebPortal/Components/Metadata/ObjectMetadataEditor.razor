@@ -1,0 +1,266 @@
+﻿@*ObjectMetadataEditor.razor*@
+@using Datahub.Metadata.Model
+@using Datahub.Metadata.DTO
+@using Datahub.Metadata.Utils;
+@using System.Text
+
+<div style="width: 100%">
+@if (_fieldValues != null)
+{
+    <MetadataEditor Preview=@Preview
+                    Profile=@_profile
+                    Definitions=@_definitions
+                    FieldValues=@_fieldValues
+                    ShowAll=@_showAll
+                    OnFieldChanged=@FieldChanged />
+
+    @if (!Preview)
+    {
+        <div>
+            <AeFlex Vertical="true">
+                <div>
+                    <AeButton class="light" @onclick=@ToggleShowAll>
+                        @(_showAll ? Localizer["METADATA-PAGE.ShowLess"] : Localizer["METADATA-PAGE.ShowMore"])
+                    </AeButton>
+                </div>
+                <div style="margin-top: 16px">
+                    <AeButton OnClickEvent=@SaveChanges Disabled=@_disableSave>@SaveButtonLabel</AeButton>
+                </div>
+            </AeFlex>
+            <div>
+                @if (_savingData)
+                {
+                    <Spinner Small=@true/>
+                }
+            </div>
+        </div>
+    }
+}
+</div>
+
+@code {
+
+    [Inject]
+    public IMetadataBrokerService MetadataBrokerService { get; set; }
+
+    [Inject]
+    public IOrganizationLevelsService OrganizationLevelsService { get; set; }
+
+    /// <summary>
+    /// Object ID to edit or add metadata
+    /// </summary>
+    [Parameter]
+    public string ObjectId { get; set; }
+
+    /// <summary>
+    /// Object name if available
+    /// </summary>
+    [Parameter]
+    public string Name { get; set; }
+
+    [Parameter]
+    public string Location { get; set; }
+
+    [Parameter]
+    public string SecurityClass { get; set; } = "Unclassified";
+
+    [Parameter]
+    public string ProfileName { get; set; } = "opendata";
+
+    [Parameter]
+    public string SaveButtonLabel { get; set; } = "Save";
+
+    [Parameter]
+    public bool ValidateRequired { get; set; } = true;
+
+    [Parameter]
+    public MetadataObjectType ObjectType { get; set; } = MetadataObjectType.File;
+
+    [Parameter]
+    public bool UpdateCatalog { get; set; }
+
+    [Parameter]
+    public bool Preview { get; set; }
+
+    [Parameter]
+    public EventCallback<FieldValueContainer> OnSave{ get; set; }
+
+    private FieldValueContainer _fieldValues;
+    private FieldDefinitions _definitions;
+    private MetadataProfile _profile;
+    private string _lastObjectId;
+
+    private bool _showAll;
+    private bool _savingData;
+    private bool _disableSave = true;
+
+    private HashSet<int> _requiredFieldIds = new();
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadFieldValues();
+        _profile = await MetadataBrokerService.GetProfile(ProfileName);
+        _disableSave = !CheckRequiredFieldValues();
+        _requiredFieldIds = _profile.GetRequiredFieldSet();
+    }
+
+    protected override async Task OnParametersSetAsync()
+    {
+        var objectHasChanged = !string.IsNullOrEmpty(_lastObjectId) && _lastObjectId != ObjectId;
+        if (objectHasChanged)
+        {
+            await LoadFieldValues();
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private async Task LoadFieldValues()
+    {
+        // the Object Id may come from an external source or from a know MetadataObject row
+        if (long.TryParse(ObjectId, out long metadataObjectId))
+        {
+            _fieldValues = await MetadataBrokerService.GetObjectMetadataValues(metadataObjectId);    
+        }
+        else
+        {
+            _fieldValues = await MetadataBrokerService.GetObjectMetadataValues(ObjectId);    
+        }
+
+        _definitions = _fieldValues.Definitions;
+        _lastObjectId = ObjectId;
+
+        // set external choices
+        await UpdateExternalFieldChoices();
+    }
+
+    public string GetTitle()
+    {
+        return _fieldValues["title_translated_en"]?.Value_TXT ?? string.Empty;
+    }
+
+    public void TogglePreview()
+    {
+        Preview = !Preview;
+    }
+
+    private bool CheckRequiredFieldValues()
+    {
+        return !ValidateRequired || _fieldValues?.ValidateRequired(IsFieldRequired) == true;
+    }
+
+    private bool IsFieldRequired(FieldDefinition field)
+    {
+        return _requiredFieldIds.Contains(field.FieldDefinitionId);
+    }
+
+    private async Task SaveChanges()
+    {
+        _savingData = true;
+        try
+        {
+            SetObjectName();
+            var objectMetadata = await MetadataBrokerService.SaveMetadata(_fieldValues);
+            if (UpdateCatalog)
+            {
+                await UpdateObjectCatalog(objectMetadata.ObjectMetadataId);
+            }
+            await OnSave.InvokeAsync(_fieldValues);
+        }
+        finally
+        {
+            _savingData = false;
+        }
+    }
+
+    private async Task UpdateObjectCatalog(long objectMetadataId)
+    {
+        var subjects = _fieldValues.GetSelectedChoices("subject").ToList();
+
+        var sectorChoice = _fieldValues.GetSelectedChoices("sector").FirstOrDefault();
+        var branchChoice = _fieldValues.GetSelectedChoices("branch").FirstOrDefault();
+
+        var objectName = _fieldValues.GetValue("name");
+
+        var englishKeywords = _fieldValues.GetValue("keywords_en").Split(',').ToList();
+        var frenchKeywords = _fieldValues.GetValue("keywords_fr").Split(',').ToList();
+
+        var englishCatalog = GetCatalogText(subjects.Select(s => s.Label_English_TXT), 
+            sectorChoice?.Label_English_TXT, branchChoice?.Label_English_TXT, objectName, englishKeywords);
+
+        var frenchCatalog = GetCatalogText(subjects.Select(s => s.Label_French_TXT), 
+            sectorChoice?.Label_French_TXT, branchChoice?.Label_French_TXT, objectName, frenchKeywords);
+
+        var sector = int.Parse(sectorChoice?.Value_TXT ?? "0");
+        var branch = int.Parse(branchChoice?.Value_TXT ?? "0");
+
+        var contact = _fieldValues.GetValue("contact_information");
+
+        await MetadataBrokerService.UpdateCatalog(objectMetadataId, ObjectType, objectName, Location, sector, branch, contact, 
+            englishCatalog, frenchCatalog);
+    }
+
+    private string GetCatalogText(IEnumerable<string> subjects, string sector, string branch, string objectName, IEnumerable<string> keywords)
+    {
+        return new StringBuilder()
+          .AppendJoin(' ', keywords)
+          .Append(' ') 
+          .AppendJoin(' ', subjects)
+          .Append(' ') 
+          .Append($"{sector} {branch} {objectName}")
+          .ToString()
+          .ToLower();
+    }
+
+    private string GetFieldValue(string name, string defaultValue = "") => _fieldValues[name]?.Value_TXT ?? defaultValue;
+
+    private void SetObjectName()
+    {
+        if (Name is not null)
+        {
+            _fieldValues.SetValue("name", Name);
+        }
+    }
+
+    private void FieldChanged()
+    {
+        _disableSave = !CheckRequiredFieldValues();
+    }
+
+    private void ToggleShowAll()
+    {
+        _showAll = !_showAll;
+    }
+
+    private async Task UpdateExternalFieldChoices()
+    {
+        foreach (var definition in _definitions.Fields)
+        {
+            switch (definition.Field_Name_TXT)
+            {
+                case "sector":
+                    definition.Choices = GetOrganizationChoices(await OrganizationLevelsService.GetSectors(), false);
+                    break;
+                case "branch":
+                    definition.Choices = GetOrganizationChoices(await OrganizationLevelsService.GetBranches(), true);
+                    break;
+                case "division":
+                    definition.Choices = GetOrganizationChoices(await OrganizationLevelsService.GetDivisions(), true);
+                    break;
+                case "section":
+                    definition.Choices = GetOrganizationChoices(await OrganizationLevelsService.GetSections(), true);
+                    break;
+            }
+        }
+    }
+
+    private List<FieldChoice> GetOrganizationChoices(List<OrganizationLevel> levels, bool cascades)
+    {
+        return levels.Select(l => new FieldChoice()
+        {
+            Value_TXT = $"{l.Id}",
+            Cascading_Value_TXT = cascades ? $"{l.ParentId}" : null,
+            Label_English_TXT = l.EnglishLabel,
+            Label_French_TXT = l.FrenchLabel
+        }).ToList();
+    }
+}

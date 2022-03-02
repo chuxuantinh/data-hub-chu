@@ -1,0 +1,277 @@
+﻿@page "/onboarding/applications"
+@page "/onboarding/applications/{AppId}"
+@inject IEmailNotificationService EmailService
+@implements IDisposable
+@inject ServiceAuthManager ServiceAuthManager
+@inject IDbContextFactory<DatahubProjectDBContext> DbFactory
+@inject IUserInformationService UserInformationService
+@inject NavigationManager NavigationManager
+@inject IJSRuntime JsInterop
+@inject UIControlsService UI
+@inject IDatahubAuditingService AuditingService
+@inject NavigationManager NavigationManager
+@inject IOrganizationLevelsService OrganizationLevelsService
+
+@using Datahub.Core.Model.Onboarding
+
+@if (_isLoaded)
+{
+<Datahub.Core.Components.FormTemplate 
+        T="OnboardingApp" 
+        U="DatahubProjectDBContext"
+        Context="Context"
+        Metadata="@_formMetadata" 
+        HandleSubmit="HandleValidSubmit"
+        OnChangeForms="OnChange"
+        OnConfigureForms="OnConfigure"
+        CreateNewRecord="CreateNewApplication"
+        SelectedRecord="@_onboardingApplication"
+        SetFormEditRecord="SetFormEdit" />
+}
+@code {
+
+    [Parameter]
+    [SupplyParameterFromQuery]
+    public bool New { get; set; }
+    [Parameter]
+    public string AppId { get; set; }
+
+    private const string PROJECTACRONYM = "DHPGLIST";
+    private FormMetadata<OnboardingApp> _formMetadata;
+    private bool _onchange;
+    private List<OnboardingApp> _onboardingApplications;
+    private OnboardingApp _onboardingApplication;
+    private DatahubProjectDBContext Context;
+    private List<string> MarkDownContent = new();
+    private Microsoft.Graph.User _user;
+    private List<Func<OnboardingApp, string>> AccessorFunctions = new List<Func<OnboardingApp, string>>();
+    private bool _isLoaded;
+
+    private List<OrganizationLevel> _sectors = new(); 
+    private List<OrganizationLevel> _branches = new(); 
+    private List<OrganizationLevel> _divisions = new();
+
+    private int _sectorId = -1;
+    private int _branchId = -1;
+    private int _divisionId = -1;
+    private bool _isUserAdmin;
+    private bool _isFrench;
+
+    private List<string> Sectors => LocalizeChoices(_sectors);
+    private List<string> Branches => LocalizeChoices(_branches.Where(b => b.ParentId == _sectorId));
+    private List<string> Divisions => LocalizeChoices(_divisions.Where(d => d.ParentId == _branchId));
+
+    private string Localize(string input) => input == null ? null : Localizer[input];
+
+    protected override async Task OnInitializedAsync()
+    {
+        // load projects
+        Context = DbFactory.CreateDbContext();
+        _user = await UserInformationService.GetUserAsync();
+        _formMetadata = new();
+        _isUserAdmin = await ServiceAuthManager.IsProjectAdmin(_user.Id, PROJECTACRONYM);
+        _isFrench = CultureInfo.CurrentCulture.Name.StartsWith("fr", StringComparison.InvariantCulture);
+
+        _sectors = await OrganizationLevelsService.GetSectors();
+        _branches = await OrganizationLevelsService.GetBranches();
+        _divisions = await OrganizationLevelsService.GetDivisions();
+
+        AccessorFunctions = new List<Func<OnboardingApp, string>>
+        {
+            p => { return Localizer[p.Client_Sector]; },
+            p => { return Localizer[p.Client_Branch ?? string.Empty]; },
+            p => { return Localizer[p.Client_Division ?? string.Empty]; },
+            p => { return p.Client_Contact_Name; },
+        };
+
+        LoadApps();
+        _formMetadata.Header = Localizer["DataHub Project Onboarding Form"];
+        _formMetadata.TableRoles = RoleConstants.DATAHUB_ROLE_ADMIN;
+        _formMetadata.DataSet = _onboardingApplications;
+        _formMetadata.AccessorFunctions = AccessorFunctions;
+        _formMetadata.Headers = headers;
+        _formMetadata.GridTemplateColumns = "4fr 4fr 4fr 4fr";
+        _formMetadata.IsSubmitEnabled = true;
+        _formMetadata.MarkDownContent = new List<string>();
+        _formMetadata.MarkDownContentFooter = new List<string>();
+
+        if (New)
+            CreateNewApplication();    
+
+        _isLoaded = true;
+        StateHasChanged();
+    }
+
+    private List<string> LocalizeChoices(IEnumerable<OrganizationLevel> levels)
+    {
+        return levels.Select(s => !_isFrench ? s.EnglishLabel : s.FrenchLabel)
+                     .OrderBy(s => s)
+                     .ToList();
+    }
+
+    private int GetChoiceId(List<OrganizationLevel> choices, string value, int? parentId = null)
+    {
+        return choices.FirstOrDefault(c => (!parentId.HasValue || c.ParentId == parentId.Value) && (c.EnglishLabel.Equals(value) || c.FrenchLabel.Equals(value)))?.Id ?? -1;
+    }
+
+    private List<string> headers => new List<string>
+    {
+        Localizer["Sector"], Localizer["Branch"], Localizer["Division"], Localizer["Contact"]        
+    };
+
+    private async Task HandleValidSubmit()
+    {
+        if (_onboardingApplication != null)
+        {
+            if (_onboardingApplication.Application_ID == 0)
+            {
+                _onboardingApplication = Context.OnboardingApps.Add(_onboardingApplication).Entity;
+            }
+            _onboardingApplication.Last_Updated_DT = DateTime.Now;
+
+            await Context.TrackSaveChangesAsync(AuditingService);
+
+            OnboardingParameters onboardingParameters = new() { 
+                            AppUrl = $"/onboarding/applications/{_onboardingApplication.Application_ID}",
+                            App = _onboardingApplication, 
+                            AdminEmailAddresses =  ServiceAuthManager.GetProjectMailboxEmails(PROJECTACRONYM)
+                        };
+            
+
+            await EmailService.SendOnboardingConfirmations(onboardingParameters);
+            
+            _onboardingApplication.NotificationsSent = true;
+
+            NavigationManager.NavigateTo("/onboarding/confirmation");
+        }
+    }
+
+    private void LoadApps()
+    {
+        _onboardingApplications = Context.OnboardingApps.ToList();
+        _formMetadata.DataSet = _onboardingApplications;
+        
+        if (!string.IsNullOrEmpty(AppId))
+        {
+            _onboardingApplication = Context.OnboardingApps.Where(a => a.Application_ID == Convert.ToInt32(AppId)).FirstOrDefault();
+            if (_onboardingApplication != null && !_isUserAdmin)
+            {
+                _onboardingApplication = null;
+            }
+        }
+
+    }
+
+    private void OnConfigure(IModelFormContext context)
+    {
+        if (!_onchange)
+        {
+            context.RegisterOptionValueProperty<OnboardingApp>(p => p.Client_Sector, () => Sectors, s => 
+            {
+                var id = GetChoiceId(_sectors, s);
+                if (_sectorId != id)
+                {
+                    _sectorId = id;
+                    RefreshBranches(context);
+                }
+            });
+
+            context.RegisterOptionValueProperty<OnboardingApp>(p => p.Client_Branch, () => Branches, s => 
+            {
+                var id = GetChoiceId(_branches, s, _sectorId);
+                if (_branchId != id)
+                {
+                    _branchId = id;
+                    RefreshDivisions(context);
+                }
+            });
+
+            context.RegisterOptionValueProperty<OnboardingApp>(p => p.Client_Division, () => Divisions, s => 
+            {
+                _divisionId = GetChoiceId(_divisions, s, _branchId);
+            });
+
+            context.RegisterOptionValueProperty<OnboardingApp>(p => p.Project_Engagement_Category, () => Onboarding_Constants.CATEGORY);
+            context.RegisterOptionValueProperty<OnboardingApp>(p => p.Data_Security_Level, () => Onboarding_Constants.SECURITYLEVEL);
+        }
+
+        ToggleVisibility(context);
+    }
+
+    private void RefreshBranches(IModelFormContext context)
+    {
+        _branchId = -1;
+        _onboardingApplication.Client_Branch = string.Empty;
+        context.RefreshOptions<OnboardingApp>(p => p.Client_Branch);
+        RefreshDivisions(context);
+    }
+
+    private void RefreshDivisions(IModelFormContext context)
+    {
+        _divisionId = -1;
+        _onboardingApplication.Client_Division = string.Empty;
+        context.RefreshOptions<OnboardingApp>(p => p.Client_Division);
+    }
+
+    private void ToggleVisibility(IModelFormContext context)
+    {
+        context.SetVisible<OnboardingApp>(p => p.Project_Engagement_Category_Other, _onboardingApplication.Project_Engagement_Category == "Other");
+        _onchange = false;
+    }
+
+    private void OnChange(ModelFormChangeArgs args)
+    {
+        //HandleTranslationFields();
+        _onchange = true;
+        OnConfigure(args.Context);
+    }
+
+    private void CreateNewApplication()
+    {
+        _onboardingApplication = new OnboardingApp() { Last_Updated_DT = DateTime.Now };
+        //var user = await UserInformationService.GetUserAsync();
+        _onboardingApplication.Client_Email = _user.Mail;
+        _onboardingApplication.Client_Contact_Name = _user.DisplayName;
+        _formMetadata.IsSubmitEnabled = true;
+        StateHasChanged();
+    }
+
+    private void SetFormEdit(OnboardingApp application)
+    {
+        _onboardingApplication = application;
+
+        if (_onboardingApplication.NotificationsSent)
+            _formMetadata.IsSubmitEnabled = false;
+
+        StateHasChanged();
+    }
+
+    @*private async void OnConfirmSave(bool isConfirmed, dynamic item)
+    {
+        if (isConfirmed && _onboardingApplication != null)
+        {
+            _onboardingApplication.Last_Updated_DT = DateTime.Now;
+            _onboardingApplication.Last_Updated_UserId = _user.Id;
+            if (_onboardingApplication.Application_ID == 0)
+            {
+                _onboardingApplication = Context.OnboardingApps.Add(_onboardingApplication).Entity;
+            }
+            await Context.TrackSaveChangesAsync(AuditingService);
+            
+        }
+        else
+        {
+            var entry = Context.Entry(_onboardingApplication);
+            foreach (var property in entry.OriginalValues.Properties)  
+            {
+                var propertyName = property.Name;
+                entry.Property(propertyName).CurrentValue = entry.Property(propertyName).OriginalValue;   
+            }              
+        }
+        await UI.ToggleModal();
+        _onboardingApplication = item;
+        StateHasChanged();
+    }*@
+
+    public void Dispose() { Context.Dispose(); }
+}

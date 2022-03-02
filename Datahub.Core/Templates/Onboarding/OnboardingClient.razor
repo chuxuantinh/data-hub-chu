@@ -1,0 +1,16 @@
+﻿@namespace Datahub.Core.Templates
+
+<p>@ApplicationParameters.App.Client_Contact_Name </p>
+<p>Thank you for filling out the Onboarding form. We’ve received your application and a DataHub team member will be in touch with you shortly.</p>
+
+<p>Please contact datahub@nrcan-rncan.gc.ca if you have questions or require additional information.</p>
+
+
+
+
+@code {
+
+    [Parameter]
+    public OnboardingParameters ApplicationParameters { get; set; }
+
+}
